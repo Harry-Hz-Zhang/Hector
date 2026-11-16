@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hector_client"
+version = "0.0.1"
+description = "Hector 向量数据库的 Python 演示客户端"
+requires-python = ">=3.14"
+dependencies = [
+  "grpcio==1.85.1",
+  "protobuf>=7.35.1,<8",
+]
+
+[project.optional-dependencies]
+dev = [
+  "grpcio-tools==1.85.1",
+  "pytest",
+]
+
+[tool.setuptools]
+packages = ["hector_client"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

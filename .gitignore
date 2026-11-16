@@ -1,0 +1,20 @@
+# 构建产物
+build/
+# 上一行会匹配任意层级名为 build 的目录；tests/build/ 是工程级检查的源码目录，必须入库。
+!tests/build/
+
+# 本机代码索引
+.codegraph/
+
+# 编辑器与本机工作区配置（不入库）
+.vscode/
+.workbuddy/
+
+# Python 客户端：虚拟环境、生成代码与字节码缓存
+clients/python/.venv/
+clients/python/hector_client/_gen/
+__pycache__/
+
+# hectord 默认数据目录
+hector_data/
+*.egg-info/

@@ -1,0 +1,125 @@
+// hector.v1：Hector 向量数据库对外协议（c0 一次写全，字段编号即正式编号）。
+// 枚举值一律带类型前缀，零值为 *_UNSPECIFIED；每个 RPC 使用自己的 <Rpc>Request 与 <Rpc>Response。
+syntax = "proto3";
+
+package hector.v1;
+
+// ---------------------------------------------------------------------------
+// 服务
+// ---------------------------------------------------------------------------
+
+service HectorService {
+  rpc CreateDatabase(CreateDatabaseRequest) returns (CreateDatabaseResponse);
+  rpc DropDatabase(DropDatabaseRequest) returns (DropDatabaseResponse);
+  rpc ListDatabases(ListDatabasesRequest) returns (ListDatabasesResponse);
+  rpc CreateTable(CreateTableRequest) returns (CreateTableResponse);
+  rpc DropTable(DropTableRequest) returns (DropTableResponse);
+  rpc ListTables(ListTablesRequest) returns (ListTablesResponse);
+  rpc DescribeTable(DescribeTableRequest) returns (DescribeTableResponse);
+  rpc Insert(InsertRequest) returns (InsertResponse);
+  rpc Upsert(UpsertRequest) returns (UpsertResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Search(SearchRequest) returns (SearchResponse);
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
+}
+
+// ---------------------------------------------------------------------------
+// RPC 请求与响应
+// ---------------------------------------------------------------------------
+
+message CreateDatabaseRequest { string name = 1; }
+message CreateDatabaseResponse {}
+
+message DropDatabaseRequest { string name = 1; }
+message DropDatabaseResponse {}
+
+message ListDatabasesRequest {}
+message ListDatabasesResponse { repeated string names = 1; }
+
+message CreateTableRequest { string database = 1; TableSchema schema = 2; }
+message CreateTableResponse {}
+
+message DropTableRequest { string database = 1; string table = 2; }
+message DropTableResponse {}
+
+message ListTablesRequest { string database = 1; }
+message ListTablesResponse { repeated string names = 1; }
+
+message DescribeTableRequest { string database = 1; string table = 2; }
+message DescribeTableResponse { TableSchema schema = 1; }
+
+message InsertRequest { string database = 1; string table = 2; repeated Row rows = 3; }
+message InsertResponse { uint64 inserted = 1; uint64 lsn = 2; }
+
+message UpsertRequest { string database = 1; string table = 2; repeated Row rows = 3; }
+message UpsertResponse { uint64 upserted = 1; uint64 lsn = 2; }
+
+message DeleteRequest { string database = 1; string table = 2; repeated string primary_keys = 3; }
+message DeleteResponse { uint64 deleted = 1; uint64 lsn = 2; }
+
+message GetRequest { string database = 1; string table = 2; repeated string primary_keys = 3; repeated string output_columns = 4; }
+message GetResponse { repeated Row rows = 1; repeated string missing_primary_keys = 2; }
+
+// SearchRequest / SearchResponse 见「数据与检索」一节。
+
+message CreateSnapshotRequest {}
+message CreateSnapshotResponse { uint64 lsn = 1; }
+
+message GetStatsRequest { string database = 1; string table = 2; }
+message GetStatsResponse { uint64 live_rows = 1; uint64 deleted_rows = 2; uint64 last_lsn = 3; repeated ColumnStats columns = 4; }
+
+// ---------------------------------------------------------------------------
+// Schema
+// ---------------------------------------------------------------------------
+
+enum Metric { METRIC_UNSPECIFIED = 0; METRIC_L2 = 1; METRIC_IP = 2; METRIC_COSINE = 3; }
+enum DenseIndexType { DENSE_INDEX_TYPE_UNSPECIFIED = 0; DENSE_INDEX_TYPE_FLAT = 1; DENSE_INDEX_TYPE_HNSW = 2; }
+enum SparseIndexType { SPARSE_INDEX_TYPE_UNSPECIFIED = 0; SPARSE_INDEX_TYPE_FLAT = 1; SPARSE_INDEX_TYPE_INVERTED = 2; }
+enum ScalarType { SCALAR_TYPE_UNSPECIFIED = 0; SCALAR_TYPE_INT64 = 1; SCALAR_TYPE_FLOAT = 2; SCALAR_TYPE_STRING = 3; }
+
+message HnswParams { uint32 m = 1; uint32 ef_construction = 2; optional uint64 seed = 3; }
+message DenseVectorColumn { uint32 dim = 1; Metric metric = 2; DenseIndexType index_type = 3; HnswParams hnsw = 4; bool int8_quantization = 5; }
+message SparseVectorColumn { uint32 max_dim = 1; SparseIndexType index_type = 2; }   // 相似度固定为内积（D34）
+message ScalarColumn { ScalarType type = 1; }
+message ColumnDef { string name = 1; oneof kind { DenseVectorColumn dense = 2; SparseVectorColumn sparse = 3; ScalarColumn scalar = 4; } }
+message TableSchema { string name = 1; repeated ColumnDef columns = 2; }
+
+message ColumnStats {
+  string name = 1;
+  oneof index { DenseIndexType dense_index_type = 2; SparseIndexType sparse_index_type = 3; }   // 普通列两者都不设
+  uint64 indexed_rows = 4;
+  uint64 memory_bytes = 5;   // 原始数据加索引派生结构的估算字节数；c6 用它核对「内存增加约 25%」
+}
+
+// ---------------------------------------------------------------------------
+// 数据与检索
+// ---------------------------------------------------------------------------
+
+message DenseVector { repeated float values = 1; }
+message SparseVector { repeated uint32 indices = 1; repeated float values = 2; }
+message Value { oneof kind { int64 int64_value = 1; float float_value = 2; string string_value = 3; DenseVector dense = 4; SparseVector sparse = 5; } }
+message Row { string primary_key = 1; map<string, Value> fields = 2; }
+
+enum CompareOp { COMPARE_OP_UNSPECIFIED = 0; COMPARE_OP_EQ = 1; COMPARE_OP_NE = 2; COMPARE_OP_LT = 3; COMPARE_OP_LE = 4; COMPARE_OP_GT = 5; COMPARE_OP_GE = 6; COMPARE_OP_IN = 7; }
+message ScalarValue { oneof kind { int64 int64_value = 1; float float_value = 2; string string_value = 3; } }
+message Condition { string column = 1; CompareOp op = 2; repeated ScalarValue values = 3; }
+message Filter { repeated Condition conditions = 1; }                                          // 条件之间只有「并且」（D18）
+
+enum FusionMethod { FUSION_METHOD_UNSPECIFIED = 0; FUSION_METHOD_RRF = 1; }
+message FusionSpec { FusionMethod method = 1; uint32 rrf_k = 2; }
+enum SparseAlgorithm { SPARSE_ALGORITHM_UNSPECIFIED = 0; SPARSE_ALGORITHM_TERM_AT_A_TIME = 1; SPARSE_ALGORITHM_WAND = 2; }   // c7 使用
+message SearchRoute {
+  string column = 1;
+  oneof query { DenseVector dense = 2; SparseVector sparse = 3; }
+  uint32 candidate_limit = 4;      // 0 表示默认
+  uint32 ef_search = 5;            // 稠密路；0 表示默认 64（D32）
+  uint32 rerank_candidates = 6;    // 稠密路且开启 int8 时生效；0 表示自动（c6 决定自动规则）
+  SparseAlgorithm sparse_algorithm = 7;   // 稀疏路；UNSPECIFIED 表示由索引自行选择
+}
+message SearchRequest { string database = 1; string table = 2; uint32 top_k = 3; repeated SearchRoute routes = 4; Filter filter = 5; FusionSpec fusion = 6; repeated string output_columns = 7; }
+
+enum ScoreKind { SCORE_KIND_UNSPECIFIED = 0; SCORE_KIND_L2_DISTANCE = 1; SCORE_KIND_INNER_PRODUCT = 2; SCORE_KIND_RRF = 3; }
+message SearchHit { string primary_key = 1; float score = 2; map<string, Value> fields = 3; }
+message SearchResponse { ScoreKind score_kind = 1; repeated SearchHit hits = 2; }

@@ -1,0 +1,3 @@
+add_executable(hector_bench flat_index_bench.cc)
+target_link_libraries(hector_bench PRIVATE hector_core benchmark::benchmark_main)
+hector_target_defaults(hector_bench)
