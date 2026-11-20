@@ -9,6 +9,7 @@ build/
 # 编辑器与本机工作区配置（不入库）
 .vscode/
 .workbuddy/
+.harry/
 
 # Python 客户端：虚拟环境、生成代码与字节码缓存
 clients/python/.venv/
