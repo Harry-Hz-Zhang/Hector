@@ -38,6 +38,7 @@ message DropDatabaseResponse {}
 message ListDatabasesRequest {}
 message ListDatabasesResponse { repeated string names = 1; }
 
+// CreateTable 使用 TableSchema 指定新表的名字和各列的类型。
 message CreateTableRequest { string database = 1; TableSchema schema = 2; }
 message CreateTableResponse {}
 
@@ -59,8 +60,20 @@ message UpsertResponse { uint64 upserted = 1; uint64 lsn = 2; }
 message DeleteRequest { string database = 1; string table = 2; repeated string primary_keys = 3; }
 message DeleteResponse { uint64 deleted = 1; uint64 lsn = 2; }
 
-message GetRequest { string database = 1; string table = 2; repeated string primary_keys = 3; repeated string output_columns = 4; }
-message GetResponse { repeated Row rows = 1; repeated string missing_primary_keys = 2; }
+// 当你知道要找哪些行的主键时，可以用 Get 直接读取这些行。
+message GetRequest {
+  string database = 1;
+  string table = 2;
+  repeated string primary_keys = 3;
+  // 这个列表指定要返回的列。留空时，服务端返回所有列。
+  repeated string output_columns = 4;
+}
+
+message GetResponse {
+  repeated Row rows = 1;
+  // 这个列表包含没找到的主键，也包括已删除的行的主键。
+  repeated string missing_primary_keys = 2;
+}
 
 // SearchRequest / SearchResponse 见「数据与检索」一节。
 
@@ -74,52 +87,238 @@ message GetStatsResponse { uint64 live_rows = 1; uint64 deleted_rows = 2; uint64
 // Schema
 // ---------------------------------------------------------------------------
 
-enum Metric { METRIC_UNSPECIFIED = 0; METRIC_L2 = 1; METRIC_IP = 2; METRIC_COSINE = 3; }
-enum DenseIndexType { DENSE_INDEX_TYPE_UNSPECIFIED = 0; DENSE_INDEX_TYPE_FLAT = 1; DENSE_INDEX_TYPE_HNSW = 2; }
-enum SparseIndexType { SPARSE_INDEX_TYPE_UNSPECIFIED = 0; SPARSE_INDEX_TYPE_FLAT = 1; SPARSE_INDEX_TYPE_INVERTED = 2; }
-enum ScalarType { SCALAR_TYPE_UNSPECIFIED = 0; SCALAR_TYPE_INT64 = 1; SCALAR_TYPE_FLOAT = 2; SCALAR_TYPE_STRING = 3; }
+// 表结构描述一张表有哪些列，以及每列可以存放什么。
+// enum 列出可选值，message 把相关字段放在一起，字段后的数字是传输时使用的编号。
 
-message HnswParams { uint32 m = 1; uint32 ef_construction = 2; optional uint64 seed = 3; }
-message DenseVectorColumn { uint32 dim = 1; Metric metric = 2; DenseIndexType index_type = 3; HnswParams hnsw = 4; bool int8_quantization = 5; }
-message SparseVectorColumn { uint32 max_dim = 1; SparseIndexType index_type = 2; }   // 相似度固定为内积（D34）
-message ScalarColumn { ScalarType type = 1; }
-message ColumnDef { string name = 1; oneof kind { DenseVectorColumn dense = 2; SparseVectorColumn sparse = 3; ScalarColumn scalar = 4; } }
-message TableSchema { string name = 1; repeated ColumnDef columns = 2; }
+// 向量是一组按位置排列的数字。Metric 决定如何比较两个稠密向量。
+enum Metric {
+  METRIC_UNSPECIFIED = 0;  // 建表时必须选一种比较方式。
+  METRIC_L2 = 1;           // 计算直线距离的平方，越小越接近。
+  METRIC_IP = 2;           // 内积把对应位置的数相乘后相加，分数越大越靠前。
+  METRIC_COSINE = 3;       // 比较方向是否一致，分数越大方向越接近。
+}
 
-message ColumnStats {
+// 索引决定服务端用什么办法从许多向量中找出相似的向量。
+enum DenseIndexType {
+  DENSE_INDEX_TYPE_UNSPECIFIED = 0;  // 未指定时使用 FLAT。
+  DENSE_INDEX_TYPE_FLAT = 1;         // 逐个比较符合条件的向量。
+  // HNSW 用分层的邻居关系图加快相似检索。当前版本尚不支持建这种索引。
+  DENSE_INDEX_TYPE_HNSW = 2;
+}
+
+enum SparseIndexType {
+  SPARSE_INDEX_TYPE_UNSPECIFIED = 0;  // 未指定时使用 FLAT。
+  SPARSE_INDEX_TYPE_FLAT = 1;         // 逐个比较符合条件的向量。
+  // 倒排索引按维度编号记录哪些向量在该位置有值。当前版本尚不支持建这种索引。
+  SPARSE_INDEX_TYPE_INVERTED = 2;
+}
+
+// 普通列可以存放单个整数、小数或文本，例如年份、价格或分类。
+enum ScalarType {
+  SCALAR_TYPE_UNSPECIFIED = 0;  // 建表时必须选一种数据类型。
+  SCALAR_TYPE_INT64 = 1;        // 存放 64 位有符号整数。
+  SCALAR_TYPE_FLOAT = 2;        // 存放 32 位浮点数，例如 3.5。
+  SCALAR_TYPE_STRING = 3;       // 存放文本。
+}
+
+// 这些参数用于构建 HNSW 图。
+message HnswParams {
+  // m 控制图中每个向量能与多少个邻居相连。填 0 时使用 16。
+  uint32 m = 1;
+  // ef_construction 控制建图时挑选邻居会考虑多少候选。填 0 时使用 200。
+  uint32 ef_construction = 2;
+  // 随机种子为建图时随机选取向量所在的最高层提供初始值。省略时使用 42，显式填 0 时使用 0。
+  optional uint64 seed = 3;
+}
+
+// 稠密向量按顺序保存每个位置的数，包括 0。
+message DenseVectorColumn {
+  uint32 dim = 1;  // 这一列的每个向量必须有这么多个数。
+  Metric metric = 2;  // 建立向量的方式 / 指标 COSIN 或者 L2 或者 内积
+  DenseIndexType index_type = 3;   // FLAT 还是 HNSW
+  HnswParams hnsw = 4;   // HNSW 建立图的指标
+  // 该选项让索引用 8 位整数近似表示向量，以节省内存。当前版本尚不支持开启。
+  bool int8_quantization = 5;
+}
+
+// 稀疏向量只需保存有值的位置，省略的位置按 0 处理。相似度固定用内积计算。
+message SparseVectorColumn {
+  // 维度编号从 0 开始，并且必须小于 max_dim。例如 max_dim 为 10 时，编号可以是 0 到 9。
+  uint32 max_dim = 1;
+  SparseIndexType index_type = 2;
+}
+
+message ScalarColumn {
+  ScalarType type = 1;  // 这个字段指定普通列能存哪一种值。
+}
+
+message ColumnDef {  // 其中一列
   string name = 1;
-  oneof index { DenseIndexType dense_index_type = 2; SparseIndexType sparse_index_type = 3; }   // 普通列两者都不设
+  // oneof 表示这些字段最多能填一个。建表时，每列必须选下面三种类型之一。
+  // 要么是稠密 / 稀疏，要么就是所谓的普通的字段
+  oneof kind {
+    DenseVectorColumn dense = 2;
+    SparseVectorColumn sparse = 3;
+    ScalarColumn scalar = 4;
+  }
+}
+
+message TableSchema {  // 整个表
+  string name = 1;  // 这是表名。
+  // repeated 表示列表。这里按顺序列出这张表的所有列。
+  repeated ColumnDef columns = 2; // 有若干列
+}
+
+// GetStats 用这条消息返回一列的索引和内存统计。
+message ColumnStats {
+  string name = 1;  // 这是列名。
+  // 服务端只填与向量列对应的索引类型。普通列的两个字段都留空。
+  oneof index {
+    DenseIndexType dense_index_type = 2;
+    SparseIndexType sparse_index_type = 3;
+  }
+  // 这是索引中记录的行数，可能包含已删除或还无法查询的行。普通列为 0。
   uint64 indexed_rows = 4;
-  uint64 memory_bytes = 5;   // 原始数据加索引派生结构的估算字节数；c6 用它核对「内存增加约 25%」
+  // 这是该列数据和索引占用内存的估算值，单位是字节。普通列只统计数据。
+  uint64 memory_bytes = 5;
 }
 
 // ---------------------------------------------------------------------------
 // 数据与检索
 // ---------------------------------------------------------------------------
 
-message DenseVector { repeated float values = 1; }
-message SparseVector { repeated uint32 indices = 1; repeated float values = 2; }
-message Value { oneof kind { int64 int64_value = 1; float float_value = 2; string string_value = 3; DenseVector dense = 4; SparseVector sparse = 5; } }
-message Row { string primary_key = 1; map<string, Value> fields = 2; }
-
-enum CompareOp { COMPARE_OP_UNSPECIFIED = 0; COMPARE_OP_EQ = 1; COMPARE_OP_NE = 2; COMPARE_OP_LT = 3; COMPARE_OP_LE = 4; COMPARE_OP_GT = 5; COMPARE_OP_GE = 6; COMPARE_OP_IN = 7; }
-message ScalarValue { oneof kind { int64 int64_value = 1; float float_value = 2; string string_value = 3; } }
-message Condition { string column = 1; CompareOp op = 2; repeated ScalarValue values = 3; }
-message Filter { repeated Condition conditions = 1; }                                          // 条件之间只有「并且」（D18）
-
-enum FusionMethod { FUSION_METHOD_UNSPECIFIED = 0; FUSION_METHOD_RRF = 1; }
-message FusionSpec { FusionMethod method = 1; uint32 rrf_k = 2; }
-enum SparseAlgorithm { SPARSE_ALGORITHM_UNSPECIFIED = 0; SPARSE_ALGORITHM_TERM_AT_A_TIME = 1; SPARSE_ALGORITHM_WAND = 2; }   // c7 使用
-message SearchRoute {
-  string column = 1;
-  oneof query { DenseVector dense = 2; SparseVector sparse = 3; }
-  uint32 candidate_limit = 4;      // 0 表示默认
-  uint32 ef_search = 5;            // 稠密路；0 表示默认 64（D32）
-  uint32 rerank_candidates = 6;    // 稠密路且开启 int8 时生效；0 表示自动（c6 决定自动规则）
-  SparseAlgorithm sparse_algorithm = 7;   // 稀疏路；UNSPECIFIED 表示由索引自行选择
+message DenseVector {
+  repeated float values = 1;  // 这个列表按位置顺序保存向量中的每个数。
 }
-message SearchRequest { string database = 1; string table = 2; uint32 top_k = 3; repeated SearchRoute routes = 4; Filter filter = 5; FusionSpec fusion = 6; repeated string output_columns = 7; }
 
-enum ScoreKind { SCORE_KIND_UNSPECIFIED = 0; SCORE_KIND_L2_DISTANCE = 1; SCORE_KIND_INNER_PRODUCT = 2; SCORE_KIND_RRF = 3; }
-message SearchHit { string primary_key = 1; float score = 2; map<string, Value> fields = 3; }
-message SearchResponse { ScoreKind score_kind = 1; repeated SearchHit hits = 2; }
+message SparseVector {
+  // 编号可以无序，但不能重复。两个列表必须等长，同一位置的编号和值配成一对。
+  // 例如 indices=[2, 5]、values=[0.8, 1] 表示第 2 号位置是 0.8，第 5 号位置是 1。
+  repeated uint32 indices = 1;
+  repeated float values = 2;
+}
+
+// Value 表示一个单元格的值，必须选一种，并且与列的类型一致。
+message Value {
+  oneof kind {
+    int64 int64_value = 1;
+    float float_value = 2;
+    string string_value = 3;
+    DenseVector dense = 4;
+    SparseVector sparse = 5;
+  }
+}
+
+message Row {
+  string primary_key = 1;  // 主键是表中一行的唯一标识，例如文章编号。
+  map<string, Value> fields = 2;  // 这个映射让你用列名找到该列的值。
+}
+
+// CompareOp 决定如何比较普通列的值，例如要求年份大于等于 2024。
+enum CompareOp {
+  COMPARE_OP_UNSPECIFIED = 0;  // 每条条件都必须选一种比较方式。
+  COMPARE_OP_EQ = 1;           // 等于。
+  COMPARE_OP_NE = 2;           // 不等于。
+  COMPARE_OP_LT = 3;           // 小于。
+  COMPARE_OP_LE = 4;           // 小于或等于。
+  COMPARE_OP_GT = 5;           // 大于。
+  COMPARE_OP_GE = 6;           // 大于或等于。
+  COMPARE_OP_IN = 7;           // 等于列表中任意一个值。
+}
+
+// ScalarValue 是筛选条件里用来比较的整数、浮点数或文本。
+message ScalarValue {
+  oneof kind {
+    int64 int64_value = 1;
+    float float_value = 2;
+    string string_value = 3;
+  }
+}
+
+// 一条条件可以表达「年份大于等于 2024」或「分类属于体育、音乐中的一种」。
+message Condition {
+  string column = 1;  // 这个字段指定要比较的普通列。
+  CompareOp op = 2;
+  // 值的类型必须和该列相同。IN 至少填一个值，其他比较方式只填一个值。
+  repeated ScalarValue values = 3;
+}
+
+message Filter {
+  // 一行必须满足这里的所有条件。列表留空时，服务端不会按普通列筛选。
+  repeated Condition conditions = 1;
+}
+
+// 当一次请求包含多路检索时，服务端用这个方法合并各路的排名。
+enum FusionMethod {
+  FUSION_METHOD_UNSPECIFIED = 0;  // 未指定时使用 RRF。
+  // 倒数排名融合（RRF）把同一行在各路的名次换算成分数，再相加。
+  FUSION_METHOD_RRF = 1;
+}
+
+message FusionSpec {
+  FusionMethod method = 1;
+  // 每路给一行的分数是 1 除以（rrf_k 加名次），名次从 1 开始。
+  // rrf_k 越大，第一名和后续名次的得分差距越小。填 0 时使用 60。
+  uint32 rrf_k = 2;
+}
+
+// 这些算法供稀疏倒排索引使用。当前的稀疏 FLAT 索引会忽略这个选项。
+enum SparseAlgorithm {
+  SPARSE_ALGORITHM_UNSPECIFIED = 0;   // 由索引选择算法。
+  // 按查询向量的维度逐个查找匹配的行，并累加分数。
+  SPARSE_ALGORITHM_TERM_AT_A_TIME = 1;
+  // WAND 判断一行最多能得多少分，从而跳过分数肯定不够的候选行。
+  SPARSE_ALGORITHM_WAND = 2;
+}
+
+// 一路检索用一个查询向量，在指定的向量列中找相似的行。
+message SearchRoute {
+  string column = 1;  // 这是要搜索的向量列名。
+  // 查询向量必须与所选列同为稠密或同为稀疏。
+  oneof query {
+    DenseVector dense = 2;
+    SparseVector sparse = 3;
+  }
+  // 多路检索时，这是本路最多交给合并步骤的条数。填 0 时取 100 和 top_k 中较大的数。
+  // 单路检索直接按 top_k 取结果。两种情况下，非 0 值都必须在 top_k 到 10000 之间。
+  uint32 candidate_limit = 4;
+  // ef_search 控制 HNSW 搜索时暂存多少个较优候选。填 0 时使用 64，稠密 FLAT 会忽略它。
+  uint32 ef_search = 5;
+  // 这个字段为启用 8 位量化的稠密索引预留。它指定用原始向量重算多少条候选的分数，再重新排序。
+  // 填 0 时由索引决定重算多少条。
+  uint32 rerank_candidates = 6;
+  SparseAlgorithm sparse_algorithm = 7;  // 这个字段为稀疏路选择检索算法。
+}
+
+// 当你有查询向量，想找内容相似的行时，可以用 Search 搜索一张表。
+message SearchRequest {
+  string database = 1;
+  string table = 2;
+  uint32 top_k = 3;  // 最终最多返回这么多条结果，取值为 1 到 1024。
+  repeated SearchRoute routes = 4;  // 一次请求可以在这张表里发起 1 到 8 路检索。
+  Filter filter = 5;  // 所有检索路线共用这组筛选条件。
+  FusionSpec fusion = 6;  // 服务端只在合并多路结果时使用这组设置。
+  // 这里可以指定要返回的普通列。留空时，每条结果只返回主键和分数。
+  repeated string output_columns = 7;
+}
+
+// ScoreKind 告诉客户端每条结果的分数是什么意思。
+enum ScoreKind {
+  SCORE_KIND_UNSPECIFIED = 0;
+  SCORE_KIND_L2_DISTANCE = 1;    // 这是直线距离的平方，越小越靠前。
+  // 单路内积、余弦和稀疏检索都用这个标记。余弦检索先把向量缩放成长度 1，再算内积。
+  SCORE_KIND_INNER_PRODUCT = 2;  // 分数越大越靠前。
+  SCORE_KIND_RRF = 3;            // 这是多路合并后的分数，越大越靠前。
+}
+
+// SearchHit 表示一条命中的行。
+message SearchHit {
+  string primary_key = 1;  // 这个主键告诉你是哪一行。
+  float score = 2;  // SearchResponse.score_kind 说明这个分数怎么读。
+  map<string, Value> fields = 3;  // 这里按列名返回 output_columns 指定的列值。
+}
+
+message SearchResponse {
+  ScoreKind score_kind = 1;
+  repeated SearchHit hits = 2;  // 结果已经排好，最符合本次查询的行放在前面。
+}
